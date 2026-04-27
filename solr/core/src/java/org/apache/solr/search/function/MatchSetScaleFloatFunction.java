@@ -39,15 +39,21 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 /**
- * Linearly scales {@code source} into {@code [targetMin, targetMax]} using the observed min/max of
- * {@code source} over the <b>current request's matching DocSet</b>.
+ * Linearly scales {@code source} into {@code [targetMin, targetMax]} using bounds derived from the
+ * <b>current request's matching DocSet</b>.
  *
- * <p>Differs from Lucene's {@code ScaleFloatFunction} in two ways:
+ * <p>Differs from Lucene's {@code ScaleFloatFunction} in three ways:
  *
  * <ul>
- *   <li>Bounds are computed over only the request's matching set (intersection of {@code q} and all
- *       {@code fq}s), not every doc in every segment. For narrowly filtered queries this can be
- *       orders of magnitude faster.
+ *   <li>{@code maxObs} is computed over only the request's matching set (intersection of
+ *       {@code q} and all non-PostFilter {@code fq}s), not every doc in every segment. For
+ *       narrowly filtered queries this is orders of magnitude faster.
+ *   <li>{@code minObs} is anchored at {@code 0} when the observed minimum is positive. This
+ *       prevents the lowest-matching doc from squashing to {@code targetMin} for non-negative
+ *       sources (Lucene scores, recency boosts, etc.). With the anchor, only {@code raw=0}
+ *       (typically a non-matching doc seen via {@code expand}) maps to {@code targetMin}; every
+ *       matching doc spreads across {@code (targetMin, targetMax]}. For sources that legitimately
+ *       produce negative values, the observed minimum is preserved.
  *   <li>Output is clamped to {@code [targetMin, targetMax]}.
  * </ul>
  *
@@ -63,8 +69,13 @@ import org.slf4j.LoggerFactory;
  *   <li><b>Reentrant guard:</b> Depth-counted guard prevents infinite recursion when
  *       {@code matchset_scale} appears inside a query being materialized.</li>
  *   <li><b>Request-level bounds cache:</b> Ensures collapse sort, expand sort, top-level sort,
- *       and fl display all see identical bounds within the same request.</li>
- *   <li><b>All-equal values:</b> When all source values are identical, returns {@code targetMin}.</li>
+ *       and fl display all see identical bounds within the same request. Synchronized writes
+ *       to the cache map (Solr's {@code req.getContext()} is a plain HashMap) make it safe to
+ *       use under Solr's parallel {@code expand} / multi-segment fl evaluation.</li>
+ *   <li><b>Missing docvalues:</b> Both fast and slow paths skip docs without a value via
+ *       {@code FunctionValues#exists(int)}, keeping bounds consistent across paths.</li>
+ *   <li><b>All-equal values (without anchor):</b> If the source can produce only one value
+ *       across the matching set AND that value is non-positive, returns {@code targetMin}.</li>
  *   <li><b>Empty matching set:</b> When no docs match, returns {@code targetMin}.</li>
  *   <li><b>NaN/Inf filtering:</b> Skipped during bounds computation and clamped during value production.</li>
  *   <li><b>No request context:</b> Falls back to full index scan gracefully.</li>
@@ -223,6 +234,10 @@ public class MatchSetScaleFloatFunction extends ValueSource {
         if (it == null) continue;
         FunctionValues vals = source.getValues(vsContext, leaf);
         for (int doc = it.nextDoc(); doc != DocIdSetIterator.NO_MORE_DOCS; doc = it.nextDoc()) {
+          // Skip docs without a value for this source — symmetric with the slow path
+          // below.  Without this check, missing-docvalue docs contribute their default
+          // (typically 0) to bounds, which is inconsistent with the fallback branch.
+          if (!vals.exists(doc)) continue;
           float v = vals.floatVal(doc);
           if (isNaNOrInf(v)) continue;
           if (v < minVal) minVal = v;
@@ -251,6 +266,18 @@ public class MatchSetScaleFloatFunction extends ValueSource {
       maxVal = 0f;
     }
 
+    // Anchor minVal at 0 for non-negative sources (Lucene scores from query()/fuzzy/etc.,
+    // and product()-of-non-negative-fields like recency boosts).
+    //
+    // Without this anchor, the lowest-matching doc squashes to targetMin (e.g. 0.05),
+    // which is misleading: a doc that DOES match shouldn't display as "no match".
+    // With the anchor, raw=0 (non-matching) maps to targetMin, and any matching doc
+    // with raw>0 spreads across (targetMin, targetMax].
+    //
+    // For sources that can produce negative values (rare in scoring contexts), the
+    // observed min is preserved.
+    if (minVal > 0f) minVal = 0f;
+
     return storeBounds(vsContext, minVal, maxVal);
   }
 
@@ -265,10 +292,17 @@ public class MatchSetScaleFloatFunction extends ValueSource {
     vsContext.put(MatchSetScaleFloatFunction.this, b);
 
     // Cache in per-request context so collapse sort, expand sort,
-    // top-level sort, and fl display all use the SAME bounds
+    // top-level sort, and fl display all use the SAME bounds.
+    //
+    // SolrQueryRequestBase.getContext() returns a plain HashMap which is NOT
+    // thread-safe.  Solr's expand component and inter-segment fl evaluation can
+    // run concurrently, so synchronize on the map to prevent lost writes /
+    // ConcurrentModificationException under load.
     Map<Object, Object> reqCtx = getRequestContext();
     if (reqCtx != null) {
-      reqCtx.put(boundsCacheKey(), b);
+      synchronized (reqCtx) {
+        reqCtx.put(boundsCacheKey(), b);
+      }
     }
 
     return b;
@@ -327,8 +361,13 @@ public class MatchSetScaleFloatFunction extends ValueSource {
     // ---- Step 4: Reentrant guard check ----
     // If we are already inside a computeBounds call for this request,
     // return null to break the cycle (triggers full-index fallback).
+    // Synchronize because reqCtx is a plain HashMap and other threads may
+    // be writing to it via storeBounds() concurrently.
     if (reqCtx != null) {
-      Object guardVal = reqCtx.get(COMPUTE_GUARD_KEY);
+      Object guardVal;
+      synchronized (reqCtx) {
+        guardVal = reqCtx.get(COMPUTE_GUARD_KEY);
+      }
       if (guardVal instanceof Integer && (Integer) guardVal > 0) {
         log.debug("matchset_scale: reentrant guard fired, falling back to full scan");
         return null;
@@ -355,9 +394,11 @@ public class MatchSetScaleFloatFunction extends ValueSource {
     // clearing the outer guard.
     int prevDepth = 0;
     if (reqCtx != null) {
-      Object val = reqCtx.get(COMPUTE_GUARD_KEY);
-      prevDepth = (val instanceof Integer) ? (Integer) val : 0;
-      reqCtx.put(COMPUTE_GUARD_KEY, prevDepth + 1);
+      synchronized (reqCtx) {
+        Object val = reqCtx.get(COMPUTE_GUARD_KEY);
+        prevDepth = (val instanceof Integer) ? (Integer) val : 0;
+        reqCtx.put(COMPUTE_GUARD_KEY, prevDepth + 1);
+      }
     }
 
     try {
@@ -372,10 +413,12 @@ public class MatchSetScaleFloatFunction extends ValueSource {
       return null;
     } finally {
       if (reqCtx != null) {
-        if (prevDepth == 0) {
-          reqCtx.remove(COMPUTE_GUARD_KEY);
-        } else {
-          reqCtx.put(COMPUTE_GUARD_KEY, prevDepth);
+        synchronized (reqCtx) {
+          if (prevDepth == 0) {
+            reqCtx.remove(COMPUTE_GUARD_KEY);
+          } else {
+            reqCtx.put(COMPUTE_GUARD_KEY, prevDepth);
+          }
         }
       }
     }
@@ -485,16 +528,21 @@ public class MatchSetScaleFloatFunction extends ValueSource {
    * @return cached Bounds, or null if none found
    */
   private Bounds lookupBounds(Map<Object, Object> vsContext) {
-    // Level 1: Request-level cache
+    // Level 1: Request-level cache.  Synchronize on the HashMap because
+    // storeBounds() also synchronizes on it — pairing the read with the write
+    // prevents a partially-published put from being observed.
     Map<Object, Object> reqCtx = getRequestContext();
     if (reqCtx != null) {
-      Object cached = reqCtx.get(boundsCacheKey());
+      Object cached;
+      synchronized (reqCtx) {
+        cached = reqCtx.get(boundsCacheKey());
+      }
       if (cached instanceof Bounds) {
         return (Bounds) cached;
       }
     }
 
-    // Level 2: Per-VS-context cache
+    // Level 2: Per-VS-context cache (single-threaded per evaluation pass)
     Object cached = vsContext.get(MatchSetScaleFloatFunction.this);
     if (cached instanceof Bounds) {
       return (Bounds) cached;
